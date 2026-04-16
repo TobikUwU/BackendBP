@@ -67,6 +67,9 @@ const OVERVIEW_STAGES = [
   { id: "overview-lod2", file: "overview.lod2.glb", ratio: 0.08, error: 0.06 },
 ];
 const TILE_STAGE = { id: "tile-detail", ratio: 0.75, error: 0.01 };
+const TARGET_ROOT_TILE_COUNT = 4;
+const MAX_TILE_BRANCHING_FACTOR = 4;
+const MAX_MESH_NODES_PER_TILE = 4;
 const uploadStatus = {
   active: false,
   phase: "idle",
@@ -119,7 +122,64 @@ async function getDirectorySize(dirPath) {
 
 async function getRelativeFiles(dirPath) {
   const files = await getAllFiles(dirPath);
-  return files.map((filePath) => path.relative(dirPath, filePath));
+  return files.map((filePath) => normalizeManifestPath(path.relative(dirPath, filePath)));
+}
+
+function normalizeManifestPath(value) {
+  return typeof value === "string" ? value.replace(/\\/g, "/") : value;
+}
+
+function buildManifestRelativePath(...segments) {
+  const normalizedSegments = segments
+    .flatMap((segment) => normalizeManifestPath(segment).split("/"))
+    .filter(Boolean);
+  return path.posix.join(...normalizedSegments);
+}
+
+function buildModelAssetUrl(modelName, relativePath) {
+  return `/${buildManifestRelativePath("models", modelName, relativePath)}`;
+}
+
+function buildModelAssetDirectory(modelName) {
+  return `${buildModelAssetUrl(modelName, "")}/`;
+}
+
+function normalizeStreamingPayload(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeStreamingPayload(item));
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entryValue]) => [
+        key,
+        shouldNormalizeStreamingField(key, entryValue)
+          ? normalizeManifestPath(entryValue)
+          : normalizeStreamingPayload(entryValue),
+      ]),
+    );
+  }
+
+  return value;
+}
+
+function shouldNormalizeStreamingField(key, value) {
+  if (typeof value !== "string") {
+    return false;
+  }
+
+  return (
+    key === "file" ||
+    key === "url" ||
+    key === "path" ||
+    key === "entryFile" ||
+    key === "entryUrl" ||
+    key === "assetDirectory" ||
+    key === "manifestUrl" ||
+    key === "bootstrapUrl" ||
+    key === "firstFrameUrl" ||
+    key.endsWith("Url")
+  );
 }
 
 function cloneExtensions(sourceDocument, targetDocument) {
@@ -274,6 +334,111 @@ function getDocumentMeshStats(document) {
   };
 }
 
+function sumMeshNodes(units) {
+  return units.reduce((sum, unit) => sum + unit.meshNodeCount, 0);
+}
+
+function mergeUnitBounds(units) {
+  return mergeBounds(units.map((unit) => unit.bounds).filter(Boolean));
+}
+
+function targetGroupCount(units, maxGroups = MAX_TILE_BRANCHING_FACTOR) {
+  if (units.length <= 1) {
+    return 1;
+  }
+
+  const desired = Math.ceil(sumMeshNodes(units) / MAX_MESH_NODES_PER_TILE);
+  return Math.min(maxGroups, Math.max(2, desired));
+}
+
+function dominantBoundsAxis(units) {
+  const bounds = mergeUnitBounds(units);
+  if (!bounds) {
+    return 0;
+  }
+
+  const extents = bounds.max.map((value, index) => value - bounds.min[index]);
+  if (extents[1] >= extents[0] && extents[1] >= extents[2]) {
+    return 1;
+  }
+  if (extents[2] >= extents[0] && extents[2] >= extents[1]) {
+    return 2;
+  }
+  return 0;
+}
+
+function splitUnitsSpatially(units, groupCount) {
+  const actualGroupCount = Math.min(groupCount, units.length);
+  if (units.length <= 1 || actualGroupCount <= 1) {
+    return [units];
+  }
+
+  const axis = dominantBoundsAxis(units);
+  const sorted = [...units].sort((left, right) => {
+    const leftValue = left.bounds?.center?.[axis] ?? 0;
+    const rightValue = right.bounds?.center?.[axis] ?? 0;
+    return leftValue - rightValue;
+  });
+
+  const groups = [];
+  for (let groupIndex = 0; groupIndex < actualGroupCount; groupIndex += 1) {
+    const start = Math.floor((groupIndex * sorted.length) / actualGroupCount);
+    const end = Math.floor(((groupIndex + 1) * sorted.length) / actualGroupCount);
+    const group = sorted.slice(start, end);
+    if (group.length) {
+      groups.push(group);
+    }
+  }
+
+  return groups;
+}
+
+function createTileCandidateName(units, depth, id) {
+  if (units.length === 1) {
+    return units[0].name || id;
+  }
+
+  const labels = [...new Set(units.map((unit) => unit.name).filter(Boolean))];
+  if (labels.length === 1) {
+    return labels[0];
+  }
+
+  return `group-d${depth}-${id}`;
+}
+
+function buildRenderableUnit(node) {
+  const childUnits = node.listChildren().map(buildRenderableUnit).filter(Boolean);
+  const meshStats = getMeshStatsFromNode(node);
+  const hasOwnMesh = meshStats.primitiveCount > 0;
+  const meshNodeCount =
+    childUnits.reduce((sum, child) => sum + child.meshNodeCount, 0) +
+    (hasOwnMesh ? 1 : 0);
+
+  if (!meshNodeCount) {
+    return null;
+  }
+
+  const boundsList = [];
+  if (hasOwnMesh) {
+    const { min, max } = getBounds(node);
+    boundsList.push(getBoundsInfo(min, max));
+  }
+  boundsList.push(...childUnits.map((child) => child.bounds).filter(Boolean));
+
+  if (!hasOwnMesh && childUnits.length === 1) {
+    return childUnits[0];
+  }
+
+  return {
+    node,
+    name: node.getName() || "",
+    hasOwnMesh,
+    meshNodeCount,
+    bounds: mergeBounds(boundsList),
+    childUnits,
+  };
+}
+
 function buildTileStreamingPlan(tiles) {
   const childMap = new Map();
 
@@ -332,52 +497,95 @@ function collectTileCandidates(sourceDocument) {
     return [];
   }
 
+  const rootUnits = scene.listChildren().map(buildRenderableUnit).filter(Boolean);
+  if (!rootUnits.length) {
+    return [];
+  }
+
   const candidates = [];
   let index = 0;
 
-  const visit = (node, depth, parentTileId) => {
-    let currentParentTileId = parentTileId;
+  const createCandidate = (units, parentTileId, depth) => {
+    const tileId = `tile-${index++}`;
+    candidates.push({
+      id: tileId,
+      sourceNodes: units.map((unit) => unit.node),
+      name: createTileCandidateName(units, depth, tileId),
+      depth,
+      parentId: parentTileId,
+      bounds: mergeUnitBounds(units),
+    });
+    return tileId;
+  };
 
-    if (node.getMesh()) {
-      const { min, max } = getBounds(node);
-      const tileId = `tile-${index++}`;
-      candidates.push({
-        id: tileId,
-        node,
-        name: node.getName() || tileId,
-        depth,
-        parentId: parentTileId,
-        bounds: getBoundsInfo(min, max),
-      });
-      currentParentTileId = tileId;
+  const buildCandidateTree = (units, parentTileId, depth) => {
+    if (!units.length) {
+      return;
     }
 
-    for (const child of node.listChildren()) {
-      visit(child, depth + 1, currentParentTileId);
+    if (units.length === 1) {
+      const [unit] = units;
+      const canSplitSubtree =
+        !unit.hasOwnMesh &&
+        unit.childUnits.length > 1 &&
+        unit.meshNodeCount > MAX_MESH_NODES_PER_TILE;
+
+      if (!canSplitSubtree) {
+        createCandidate(units, parentTileId, depth);
+        return;
+      }
+
+      const tileId = createCandidate(units, parentTileId, depth);
+      const childGroups = splitUnitsSpatially(
+        unit.childUnits,
+        targetGroupCount(unit.childUnits),
+      );
+      for (const childGroup of childGroups) {
+        buildCandidateTree(childGroup, tileId, depth + 1);
+      }
+      return;
+    }
+
+    if (sumMeshNodes(units) <= MAX_MESH_NODES_PER_TILE) {
+      createCandidate(units, parentTileId, depth);
+      return;
+    }
+
+    const tileId = createCandidate(units, parentTileId, depth);
+    const childGroups = splitUnitsSpatially(units, targetGroupCount(units));
+    for (const childGroup of childGroups) {
+      buildCandidateTree(childGroup, tileId, depth + 1);
     }
   };
 
-  for (const child of scene.listChildren()) {
-    visit(child, 0, null);
+  const rootGroups = splitUnitsSpatially(
+    rootUnits,
+    targetGroupCount(rootUnits, TARGET_ROOT_TILE_COUNT),
+  );
+  for (const rootGroup of rootGroups) {
+    buildCandidateTree(rootGroup, null, 0);
   }
 
   return candidates;
 }
 
-async function createTileDocument(sourceDocument, sourceNode) {
+async function createTileDocument(sourceDocument, sourceNodes) {
   const tileDocument = new Document();
   cloneExtensions(sourceDocument, tileDocument);
 
   const tileScene = tileDocument.createScene("TileScene");
-  const map = copyToDocument(tileDocument, sourceDocument, [sourceNode]);
-  const tileNode = map.get(sourceNode);
+  const nodes = [...new Set([].concat(sourceNodes || []).filter(Boolean))];
+  const map = copyToDocument(tileDocument, sourceDocument, nodes);
 
-  if (!tileNode) {
-    throw new Error("Nepodařilo se zkopírovat tile node.");
+  for (const sourceNode of nodes) {
+    const tileNode = map.get(sourceNode);
+    if (!tileNode) {
+      throw new Error("Nepodařilo se zkopírovat tile node.");
+    }
+
+    tileNode.setMatrix(sourceNode.getWorldMatrix());
+    tileScene.addChild(tileNode);
   }
-
-  tileNode.setMatrix(sourceNode.getWorldMatrix());
-  tileScene.addChild(tileNode);
 
   return tileDocument;
 }
@@ -404,15 +612,15 @@ async function buildOverviewStages(sourceDocument, modelDir) {
       );
       const meshStats = getDocumentMeshStats(stageDocument);
 
-      const relativePath = path.join("overview", stage.file);
-      const absolutePath = path.join(modelDir, relativePath);
+      const relativePath = buildManifestRelativePath("overview", stage.file);
+      const absolutePath = path.join(modelDir, "overview", stage.file);
       await writeDocumentAsGlb(absolutePath, stageDocument);
       const stats = await fsp.stat(absolutePath);
 
       stages.push({
         id: stage.id,
         file: relativePath,
-        url: `/models/${path.basename(modelDir)}/${relativePath}`,
+        url: buildModelAssetUrl(path.basename(modelDir), relativePath),
         size: stats.size,
         ratio: stage.ratio,
         error: stage.error,
@@ -445,7 +653,10 @@ async function buildDetailTiles(
 
   for (const candidate of tileCandidates) {
     try {
-      const tileDocument = await createTileDocument(sourceDocument, candidate.node);
+      const tileDocument = await createTileDocument(
+        sourceDocument,
+        candidate.sourceNodes,
+      );
       await tileDocument.transform(
         weld(),
         simplify({
@@ -459,8 +670,8 @@ async function buildDetailTiles(
       );
       const meshStats = getDocumentMeshStats(tileDocument);
 
-      const relativePath = path.join("tiles", `${candidate.id}.glb`);
-      const absolutePath = path.join(modelDir, relativePath);
+      const relativePath = buildManifestRelativePath("tiles", `${candidate.id}.glb`);
+      const absolutePath = path.join(modelDir, "tiles", `${candidate.id}.glb`);
       await writeDocumentAsGlb(absolutePath, tileDocument);
       const stats = await fsp.stat(absolutePath);
 
@@ -472,7 +683,7 @@ async function buildDetailTiles(
         refinement: "replace",
         format: "glb",
         file: relativePath,
-        url: `/models/${path.basename(modelDir)}/${relativePath}`,
+        url: buildModelAssetUrl(path.basename(modelDir), relativePath),
         size: stats.size,
         ratio: TILE_STAGE.ratio,
         error: TILE_STAGE.error,
@@ -526,7 +737,7 @@ async function buildStreamingPackage(modelName, sourceDocument, modelDir) {
         const stats = await fsp.stat(absolutePath);
         return {
           path: file,
-          url: `/models/${modelName}/${file}`,
+          url: buildModelAssetUrl(modelName, file),
           size: stats.size,
           type: path.extname(file).toLowerCase().slice(1) || "bin",
         };
@@ -606,8 +817,8 @@ async function writeModelMetadata(modelName, modelDir, manifest) {
     type: "mesh-stream-package",
     entryFile: entryStage.file,
     entryUrl: entryStage.url,
-    assetDirectory: `/models/${modelName}/`,
-    manifestUrl: `/models/${modelName}/stream.manifest.json`,
+    assetDirectory: buildModelAssetDirectory(modelName),
+    manifestUrl: buildModelAssetUrl(modelName, "stream.manifest.json"),
     bootstrapUrl: `/stream-bootstrap/${modelName}`,
     streamingStrategy: manifest.strategy,
     entryStage: manifest.entryStage,
@@ -1050,8 +1261,9 @@ function decodeParam(value) {
 }
 
 function resolvePublicPath(pathname) {
+  const safePathname = pathname.replace(/%5c/gi, "/").replace(/\\/g, "/");
   const normalized =
-    pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
+    safePathname === "/" ? "index.html" : safePathname.replace(/^\/+/, "");
   const resolved = path.resolve(PUBLIC_DIR, normalized);
 
   if (
@@ -1266,7 +1478,7 @@ async function handleModelMetadata(modelName) {
 
   try {
     const metadataContent = await fsp.readFile(metadataPath, "utf8");
-    const metadata = JSON.parse(metadataContent);
+    const metadata = normalizeStreamingPayload(JSON.parse(metadataContent));
 
     return jsonResponse({
       success: true,
@@ -1289,8 +1501,9 @@ async function handleStreamManifest(modelName) {
       path.join(MODELS_DIR, modelName, "stream.manifest.json"),
       "utf8",
     );
+    const manifest = normalizeStreamingPayload(JSON.parse(manifestContent));
 
-    return new Response(manifestContent, {
+    return new Response(JSON.stringify(manifest), {
       headers: {
         "Content-Type": "application/json; charset=utf-8",
         "Cache-Control": "public, max-age=31536000",
@@ -1314,8 +1527,8 @@ async function handleStreamBootstrap(modelName) {
       fsp.readFile(path.join(MODELS_DIR, modelName, "stream.manifest.json"), "utf8"),
     ]);
 
-    const metadata = JSON.parse(metadataContent);
-    const manifest = JSON.parse(manifestContent);
+    const metadata = normalizeStreamingPayload(JSON.parse(metadataContent));
+    const manifest = normalizeStreamingPayload(JSON.parse(manifestContent));
 
     return jsonResponse({
       success: true,
@@ -1364,7 +1577,7 @@ async function handleModelsList() {
     const modelTasks = metadataFiles.map(async (file) => {
       const metadataPath = path.join(METADATA_DIR, file);
       const metadataContent = await fsp.readFile(metadataPath, "utf8");
-      const metadata = JSON.parse(metadataContent);
+      const metadata = normalizeStreamingPayload(JSON.parse(metadataContent));
       const stats = await fsp.stat(metadataPath);
 
       if (!metadata.entryFile || !metadata.entryUrl) {
@@ -1419,7 +1632,7 @@ async function handleDownloadModel(request, modelName) {
       path.join(METADATA_DIR, `${modelName}.json`),
       "utf8",
     );
-    const metadata = JSON.parse(metadataContent);
+    const metadata = normalizeStreamingPayload(JSON.parse(metadataContent));
 
     return Response.redirect(new URL(metadata.entryUrl, request.url), 302);
   } catch {
@@ -1437,7 +1650,7 @@ async function handleModelInfo(modelName) {
   try {
     const metadataPath = path.join(METADATA_DIR, `${modelName}.json`);
     const metadataContent = await fsp.readFile(metadataPath, "utf8");
-    const metadata = JSON.parse(metadataContent);
+    const metadata = normalizeStreamingPayload(JSON.parse(metadataContent));
     const stats = await fsp.stat(metadataPath);
 
     return jsonResponse({
