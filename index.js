@@ -1,12 +1,27 @@
-const express = require("express");
-const multer = require("multer");
-const path = require("path");
-const fs = require("fs");
+import path from "node:path";
+import fs from "node:fs";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { execSync } from "node:child_process";
+import { Document, NodeIO } from "@gltf-transform/core";
+import { ALL_EXTENSIONS } from "@gltf-transform/extensions";
+import {
+  cloneDocument,
+  copyToDocument,
+  dedup,
+  getBounds,
+  prune,
+  reorder,
+  simplify,
+  weld,
+} from "@gltf-transform/functions";
+import Busboy from "busboy";
+import { MeshoptEncoder, MeshoptSimplifier } from "meshoptimizer";
+import sharp from "sharp";
+import unzipper from "unzipper";
+
 const fsp = fs.promises;
-const crypto = require("crypto");
-const zlib = require("zlib");
-const util = require("util");
-const { execSync } = require("child_process");
+const __dirname = import.meta.dir;
 
 /**
  * Zajistí existenci SSL certifikátů (key.pem, cert.pem) pro HTTPS
@@ -37,28 +52,36 @@ function ensureSslCertificates() {
 // Spustí kontrolu SSL certifikátů na začátku aplikace
 ensureSslCertificates();
 
-const gzip = util.promisify(zlib.gzip);
-const gunzip = util.promisify(zlib.gunzip);
-
-const gltfPipeline = require("gltf-pipeline");
-const gltfToGlb = gltfPipeline.gltfToGlb;
-const AdmZip = require("adm-zip");
-const sharp = require("sharp");
-
-const http2Express = require("http2-express");
-const app = http2Express(express);
-const port = 3000;
+const port = Number(process.env.PORT || 3000);
+const httpsPort = Number(process.env.HTTPS_PORT || 3443);
 
 // Konfigurace
 const UPLOAD_DIR = "./tmp_uploads";
+const PUBLIC_DIR = path.join(__dirname, "public");
 const MODELS_DIR = path.join(__dirname, "public", "models");
-const CHUNKS_DIR = path.join(__dirname, "public", "chunks");
 const METADATA_DIR = path.join(__dirname, "public", "metadata");
-const CHUNK_SIZE = 1024 * 1024; // 1 MB chunks
+const MAX_UPLOAD_SIZE = 5 * 1024 * 1024 * 1024;
+const OVERVIEW_STAGES = [
+  { id: "overview-lod0", file: "overview.lod0.glb", ratio: 0.45, error: 0.015 },
+  { id: "overview-lod1", file: "overview.lod1.glb", ratio: 0.2, error: 0.03 },
+  { id: "overview-lod2", file: "overview.lod2.glb", ratio: 0.08, error: 0.06 },
+];
+const TILE_STAGE = { id: "tile-detail", ratio: 0.75, error: 0.01 };
+const TARGET_ROOT_TILE_COUNT = 4;
+const MAX_TILE_BRANCHING_FACTOR = 4;
+const MAX_MESH_NODES_PER_TILE = 4;
+const uploadStatus = {
+  active: false,
+  phase: "idle",
+  message: "Žádný aktivní upload.",
+  startedAt: null,
+  updatedAt: null,
+  logs: [],
+};
 
 // Vytvoření potřebných složek
 console.log("Vytvářím složky...");
-[UPLOAD_DIR, MODELS_DIR, CHUNKS_DIR, METADATA_DIR].forEach((dir) => {
+[UPLOAD_DIR, MODELS_DIR, METADATA_DIR].forEach((dir) => {
   try {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
@@ -70,10 +93,6 @@ console.log("Vytvářím složky...");
     console.error(`Chyba při vytváření ${dir}:`, err.message);
   }
 });
-
-// Middleware
-app.use(express.static(path.join(__dirname, "public")));
-app.use(express.json());
 
 // UTILITY FUNKCE
 
@@ -95,16 +114,758 @@ async function getAllFiles(dirPath, arrayOfFiles = []) {
   return arrayOfFiles;
 }
 
-function calculateFileHash(filePath) {
-  return new Promise((resolve, reject) => {
-    const hash = crypto.createHash("sha256");
-    const stream = fs.createReadStream(filePath);
-
-    stream.on("data", (data) => hash.update(data));
-    stream.on("end", () => resolve(hash.digest("hex")));
-    stream.on("error", reject);
-  });
+async function getDirectorySize(dirPath) {
+  const files = await getAllFiles(dirPath);
+  const stats = await Promise.all(files.map((filePath) => fsp.stat(filePath)));
+  return stats.reduce((sum, stat) => sum + stat.size, 0);
 }
+
+async function getRelativeFiles(dirPath) {
+  const files = await getAllFiles(dirPath);
+  return files.map((filePath) => normalizeManifestPath(path.relative(dirPath, filePath)));
+}
+
+function normalizeManifestPath(value) {
+  return typeof value === "string" ? value.replace(/\\/g, "/") : value;
+}
+
+function buildManifestRelativePath(...segments) {
+  const normalizedSegments = segments
+    .flatMap((segment) => normalizeManifestPath(segment).split("/"))
+    .filter(Boolean);
+  return path.posix.join(...normalizedSegments);
+}
+
+function buildModelAssetUrl(modelName, relativePath) {
+  return `/${buildManifestRelativePath("models", modelName, relativePath)}`;
+}
+
+function buildModelAssetDirectory(modelName) {
+  return `${buildModelAssetUrl(modelName, "")}/`;
+}
+
+function normalizeStreamingPayload(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeStreamingPayload(item));
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entryValue]) => [
+        key,
+        shouldNormalizeStreamingField(key, entryValue)
+          ? normalizeManifestPath(entryValue)
+          : normalizeStreamingPayload(entryValue),
+      ]),
+    );
+  }
+
+  return value;
+}
+
+function shouldNormalizeStreamingField(key, value) {
+  if (typeof value !== "string") {
+    return false;
+  }
+
+  return (
+    key === "file" ||
+    key === "url" ||
+    key === "path" ||
+    key === "entryFile" ||
+    key === "entryUrl" ||
+    key === "assetDirectory" ||
+    key === "manifestUrl" ||
+    key === "bootstrapUrl" ||
+    key === "firstFrameUrl" ||
+    key.endsWith("Url")
+  );
+}
+
+function cloneExtensions(sourceDocument, targetDocument) {
+  for (const sourceExtension of sourceDocument.getRoot().listExtensionsUsed()) {
+    const targetExtension = targetDocument.createExtension(
+      sourceExtension.constructor,
+    );
+    targetExtension.setRequired(sourceExtension.isRequired());
+  }
+}
+
+async function writeDocumentAsGlb(outputPath, document) {
+  const glb = await io.writeBinary(document);
+  await fsp.writeFile(outputPath, glb);
+}
+
+function getBoundsInfo(min, max) {
+  const center = min.map((value, index) => (value + max[index]) / 2);
+  const radius = Math.sqrt(
+    min.reduce((sum, value, index) => {
+      const delta = max[index] - value;
+      return sum + delta * delta;
+    }, 0),
+  ) / 2;
+
+  return {
+    min,
+    max,
+    center,
+    radius,
+  };
+}
+
+function mergeBounds(boundsList) {
+  if (!boundsList.length) {
+    return null;
+  }
+
+  const min = [...boundsList[0].min];
+  const max = [...boundsList[0].max];
+
+  for (const bounds of boundsList.slice(1)) {
+    for (let index = 0; index < 3; index += 1) {
+      min[index] = Math.min(min[index], bounds.min[index]);
+      max[index] = Math.max(max[index], bounds.max[index]);
+    }
+  }
+
+  return getBoundsInfo(min, max);
+}
+
+function countPrimitiveTriangles(primitive) {
+  const indices = primitive.getIndices();
+  const positions = primitive.getAttribute("POSITION");
+  const vertexCount = indices?.getCount() ?? positions?.getCount() ?? 0;
+
+  switch (primitive.getMode()) {
+    case 5:
+    case 6:
+      return Math.max(vertexCount - 2, 0);
+    case 4:
+    default:
+      return Math.floor(vertexCount / 3);
+  }
+}
+
+function getMeshStatsFromNode(node) {
+  const mesh = node.getMesh();
+
+  if (!mesh) {
+    return {
+      primitiveCount: 0,
+      triangleCount: 0,
+      materialCount: 0,
+    };
+  }
+
+  const materials = new Set();
+  let primitiveCount = 0;
+  let triangleCount = 0;
+
+  for (const primitive of mesh.listPrimitives()) {
+    primitiveCount += 1;
+    triangleCount += countPrimitiveTriangles(primitive);
+
+    const material = primitive.getMaterial();
+    if (material) {
+      materials.add(material);
+    }
+  }
+
+  return {
+    primitiveCount,
+    triangleCount,
+    materialCount: materials.size,
+  };
+}
+
+function getDocumentMeshStats(document) {
+  const root = document.getRoot();
+  const scene = root.getDefaultScene() || root.listScenes()[0];
+
+  if (!scene) {
+    return {
+      nodeCount: 0,
+      meshNodeCount: 0,
+      primitiveCount: 0,
+      triangleCount: 0,
+      materialCount: 0,
+    };
+  }
+
+  const materials = new Set();
+  let nodeCount = 0;
+  let meshNodeCount = 0;
+  let primitiveCount = 0;
+  let triangleCount = 0;
+
+  const visit = (node) => {
+    nodeCount += 1;
+
+    const meshStats = getMeshStatsFromNode(node);
+    if (meshStats.primitiveCount > 0) {
+      meshNodeCount += 1;
+      primitiveCount += meshStats.primitiveCount;
+      triangleCount += meshStats.triangleCount;
+
+      const mesh = node.getMesh();
+      for (const primitive of mesh.listPrimitives()) {
+        const material = primitive.getMaterial();
+        if (material) {
+          materials.add(material);
+        }
+      }
+    }
+
+    for (const child of node.listChildren()) {
+      visit(child);
+    }
+  };
+
+  for (const child of scene.listChildren()) {
+    visit(child);
+  }
+
+  return {
+    nodeCount,
+    meshNodeCount,
+    primitiveCount,
+    triangleCount,
+    materialCount: materials.size,
+  };
+}
+
+function sumMeshNodes(units) {
+  return units.reduce((sum, unit) => sum + unit.meshNodeCount, 0);
+}
+
+function mergeUnitBounds(units) {
+  return mergeBounds(units.map((unit) => unit.bounds).filter(Boolean));
+}
+
+function targetGroupCount(units, maxGroups = MAX_TILE_BRANCHING_FACTOR) {
+  if (units.length <= 1) {
+    return 1;
+  }
+
+  const desired = Math.ceil(sumMeshNodes(units) / MAX_MESH_NODES_PER_TILE);
+  return Math.min(maxGroups, Math.max(2, desired));
+}
+
+function dominantBoundsAxis(units) {
+  const bounds = mergeUnitBounds(units);
+  if (!bounds) {
+    return 0;
+  }
+
+  const extents = bounds.max.map((value, index) => value - bounds.min[index]);
+  if (extents[1] >= extents[0] && extents[1] >= extents[2]) {
+    return 1;
+  }
+  if (extents[2] >= extents[0] && extents[2] >= extents[1]) {
+    return 2;
+  }
+  return 0;
+}
+
+function splitUnitsSpatially(units, groupCount) {
+  const actualGroupCount = Math.min(groupCount, units.length);
+  if (units.length <= 1 || actualGroupCount <= 1) {
+    return [units];
+  }
+
+  const axis = dominantBoundsAxis(units);
+  const sorted = [...units].sort((left, right) => {
+    const leftValue = left.bounds?.center?.[axis] ?? 0;
+    const rightValue = right.bounds?.center?.[axis] ?? 0;
+    return leftValue - rightValue;
+  });
+
+  const groups = [];
+  for (let groupIndex = 0; groupIndex < actualGroupCount; groupIndex += 1) {
+    const start = Math.floor((groupIndex * sorted.length) / actualGroupCount);
+    const end = Math.floor(((groupIndex + 1) * sorted.length) / actualGroupCount);
+    const group = sorted.slice(start, end);
+    if (group.length) {
+      groups.push(group);
+    }
+  }
+
+  return groups;
+}
+
+function createTileCandidateName(units, depth, id) {
+  if (units.length === 1) {
+    return units[0].name || id;
+  }
+
+  const labels = [...new Set(units.map((unit) => unit.name).filter(Boolean))];
+  if (labels.length === 1) {
+    return labels[0];
+  }
+
+  return `group-d${depth}-${id}`;
+}
+
+function buildRenderableUnit(node) {
+  const childUnits = node.listChildren().map(buildRenderableUnit).filter(Boolean);
+  const meshStats = getMeshStatsFromNode(node);
+  const hasOwnMesh = meshStats.primitiveCount > 0;
+  const meshNodeCount =
+    childUnits.reduce((sum, child) => sum + child.meshNodeCount, 0) +
+    (hasOwnMesh ? 1 : 0);
+
+  if (!meshNodeCount) {
+    return null;
+  }
+
+  const boundsList = [];
+  if (hasOwnMesh) {
+    const { min, max } = getBounds(node);
+    boundsList.push(getBoundsInfo(min, max));
+  }
+  boundsList.push(...childUnits.map((child) => child.bounds).filter(Boolean));
+
+  if (!hasOwnMesh && childUnits.length === 1) {
+    return childUnits[0];
+  }
+
+  return {
+    node,
+    name: node.getName() || "",
+    hasOwnMesh,
+    meshNodeCount,
+    bounds: mergeBounds(boundsList),
+    childUnits,
+  };
+}
+
+function buildTileStreamingPlan(tiles) {
+  const childMap = new Map();
+
+  for (const tile of tiles) {
+    if (!tile.parentId) {
+      continue;
+    }
+
+    if (!childMap.has(tile.parentId)) {
+      childMap.set(tile.parentId, []);
+    }
+
+    childMap.get(tile.parentId).push(tile.id);
+  }
+
+  const traversalOrder = [...tiles]
+    .sort((left, right) => {
+      if (left.depth !== right.depth) {
+        return left.depth - right.depth;
+      }
+
+      if (left.bounds.radius !== right.bounds.radius) {
+        return right.bounds.radius - left.bounds.radius;
+      }
+
+      if (left.size !== right.size) {
+        return right.size - left.size;
+      }
+
+      return left.id.localeCompare(right.id);
+    })
+    .map((tile) => tile.id);
+
+  const priorityMap = new Map(
+    traversalOrder.map((tileId, index) => [tileId, index + 1]),
+  );
+
+  return {
+    traversalOrder,
+    tiles: tiles.map((tile) => ({
+      ...tile,
+      children: childMap.get(tile.id) || [],
+      priority: priorityMap.get(tile.id),
+      screenCoverageHint: Number(
+        (tile.bounds.radius * Math.max(1, 3 - tile.depth)).toFixed(4),
+      ),
+    })),
+  };
+}
+
+function collectTileCandidates(sourceDocument) {
+  const root = sourceDocument.getRoot();
+  const scene = root.getDefaultScene() || root.listScenes()[0];
+
+  if (!scene) {
+    return [];
+  }
+
+  const rootUnits = scene.listChildren().map(buildRenderableUnit).filter(Boolean);
+  if (!rootUnits.length) {
+    return [];
+  }
+
+  const candidates = [];
+  let index = 0;
+
+  const createCandidate = (units, parentTileId, depth) => {
+    const tileId = `tile-${index++}`;
+    candidates.push({
+      id: tileId,
+      sourceNodes: units.map((unit) => unit.node),
+      name: createTileCandidateName(units, depth, tileId),
+      depth,
+      parentId: parentTileId,
+      bounds: mergeUnitBounds(units),
+    });
+    return tileId;
+  };
+
+  const buildCandidateTree = (units, parentTileId, depth) => {
+    if (!units.length) {
+      return;
+    }
+
+    if (units.length === 1) {
+      const [unit] = units;
+      const canSplitSubtree =
+        !unit.hasOwnMesh &&
+        unit.childUnits.length > 1 &&
+        unit.meshNodeCount > MAX_MESH_NODES_PER_TILE;
+
+      if (!canSplitSubtree) {
+        createCandidate(units, parentTileId, depth);
+        return;
+      }
+
+      const tileId = createCandidate(units, parentTileId, depth);
+      const childGroups = splitUnitsSpatially(
+        unit.childUnits,
+        targetGroupCount(unit.childUnits),
+      );
+      for (const childGroup of childGroups) {
+        buildCandidateTree(childGroup, tileId, depth + 1);
+      }
+      return;
+    }
+
+    if (sumMeshNodes(units) <= MAX_MESH_NODES_PER_TILE) {
+      createCandidate(units, parentTileId, depth);
+      return;
+    }
+
+    const tileId = createCandidate(units, parentTileId, depth);
+    const childGroups = splitUnitsSpatially(units, targetGroupCount(units));
+    for (const childGroup of childGroups) {
+      buildCandidateTree(childGroup, tileId, depth + 1);
+    }
+  };
+
+  const rootGroups = splitUnitsSpatially(
+    rootUnits,
+    targetGroupCount(rootUnits, TARGET_ROOT_TILE_COUNT),
+  );
+  for (const rootGroup of rootGroups) {
+    buildCandidateTree(rootGroup, null, 0);
+  }
+
+  return candidates;
+}
+
+async function createTileDocument(sourceDocument, sourceNodes) {
+  const tileDocument = new Document();
+  cloneExtensions(sourceDocument, tileDocument);
+
+  const tileScene = tileDocument.createScene("TileScene");
+  const nodes = [...new Set([].concat(sourceNodes || []).filter(Boolean))];
+  const map = copyToDocument(tileDocument, sourceDocument, nodes);
+
+  for (const sourceNode of nodes) {
+    const tileNode = map.get(sourceNode);
+    if (!tileNode) {
+      throw new Error("Nepodařilo se zkopírovat tile node.");
+    }
+
+    tileNode.setMatrix(sourceNode.getWorldMatrix());
+    tileScene.addChild(tileNode);
+  }
+
+  return tileDocument;
+}
+
+async function buildOverviewStages(sourceDocument, modelDir) {
+  const overviewDir = path.join(modelDir, "overview");
+  await fsp.mkdir(overviewDir, { recursive: true });
+
+  const stages = [];
+
+  for (const stage of OVERVIEW_STAGES) {
+    try {
+      const stageDocument = cloneDocument(sourceDocument);
+      await stageDocument.transform(
+        weld(),
+        simplify({
+          simplifier: MeshoptSimplifier,
+          ratio: stage.ratio,
+          error: stage.error,
+        }),
+        dedup(),
+        prune(),
+        reorder({ encoder: MeshoptEncoder, target: "size" }),
+      );
+      const meshStats = getDocumentMeshStats(stageDocument);
+
+      const relativePath = buildManifestRelativePath("overview", stage.file);
+      const absolutePath = path.join(modelDir, "overview", stage.file);
+      await writeDocumentAsGlb(absolutePath, stageDocument);
+      const stats = await fsp.stat(absolutePath);
+
+      stages.push({
+        id: stage.id,
+        file: relativePath,
+        url: buildModelAssetUrl(path.basename(modelDir), relativePath),
+        size: stats.size,
+        ratio: stage.ratio,
+        error: stage.error,
+        geometricError: Number((stage.error * 100).toFixed(4)),
+        triangleCount: meshStats.triangleCount,
+        primitiveCount: meshStats.primitiveCount,
+        meshNodeCount: meshStats.meshNodeCount,
+      });
+    } catch (error) {
+      console.error(`Overview stage ${stage.id} se nepodařilo vytvořit:`, error);
+    }
+  }
+
+  if (stages.length === 0) {
+    throw new Error("Nepodařilo se vytvořit žádný overview stage.");
+  }
+
+  return stages;
+}
+
+async function buildDetailTiles(
+  sourceDocument,
+  modelDir,
+  tileCandidates = collectTileCandidates(sourceDocument),
+) {
+  const tilesDir = path.join(modelDir, "tiles");
+  await fsp.mkdir(tilesDir, { recursive: true });
+
+  const tiles = [];
+
+  for (const candidate of tileCandidates) {
+    try {
+      const tileDocument = await createTileDocument(
+        sourceDocument,
+        candidate.sourceNodes,
+      );
+      await tileDocument.transform(
+        weld(),
+        simplify({
+          simplifier: MeshoptSimplifier,
+          ratio: TILE_STAGE.ratio,
+          error: TILE_STAGE.error,
+        }),
+        dedup(),
+        prune(),
+        reorder({ encoder: MeshoptEncoder, target: "size" }),
+      );
+      const meshStats = getDocumentMeshStats(tileDocument);
+
+      const relativePath = buildManifestRelativePath("tiles", `${candidate.id}.glb`);
+      const absolutePath = path.join(modelDir, "tiles", `${candidate.id}.glb`);
+      await writeDocumentAsGlb(absolutePath, tileDocument);
+      const stats = await fsp.stat(absolutePath);
+
+      tiles.push({
+        id: candidate.id,
+        parentId: candidate.parentId,
+        name: candidate.name,
+        depth: candidate.depth,
+        refinement: "replace",
+        format: "glb",
+        file: relativePath,
+        url: buildModelAssetUrl(path.basename(modelDir), relativePath),
+        size: stats.size,
+        ratio: TILE_STAGE.ratio,
+        error: TILE_STAGE.error,
+        geometricError: Number((candidate.bounds.radius * TILE_STAGE.error).toFixed(4)),
+        bounds: candidate.bounds,
+        triangleCount: meshStats.triangleCount,
+        primitiveCount: meshStats.primitiveCount,
+        meshNodeCount: meshStats.meshNodeCount,
+      });
+    } catch (error) {
+      console.error(`Tile ${candidate.id} se nepodařilo vytvořit:`, error);
+    }
+  }
+
+  return tiles;
+}
+
+async function buildStreamingPackage(modelName, sourceDocument, modelDir) {
+  await MeshoptEncoder.ready;
+  await MeshoptSimplifier.ready;
+
+  const tileCandidates = collectTileCandidates(sourceDocument);
+  const sourceStats = getDocumentMeshStats(sourceDocument);
+  const sceneBounds = mergeBounds(tileCandidates.map((candidate) => candidate.bounds));
+  const overviewStages = await buildOverviewStages(sourceDocument, modelDir);
+  const rawDetailTiles = await buildDetailTiles(
+    sourceDocument,
+    modelDir,
+    tileCandidates,
+  );
+  const detailTilePlan = buildTileStreamingPlan(rawDetailTiles);
+  const detailTiles = detailTilePlan.tiles;
+  const entryStage =
+    overviewStages[overviewStages.length - 1] || overviewStages[0] || null;
+  const rootTiles = detailTiles
+    .filter((tile) => tile.parentId === null)
+    .map((tile) => tile.id);
+  const upgradeOrder = [...overviewStages].reverse().map((stage) => stage.id);
+
+  const allFiles = await getRelativeFiles(modelDir);
+  const referencedFiles = new Set([
+    ...overviewStages.map((stage) => stage.file),
+    ...detailTiles.map((tile) => tile.file),
+  ]);
+
+  const sharedResources = await Promise.all(
+    allFiles
+      .filter((file) => !referencedFiles.has(file))
+      .map(async (file) => {
+        const absolutePath = path.join(modelDir, file);
+        const stats = await fsp.stat(absolutePath);
+        return {
+          path: file,
+          url: buildModelAssetUrl(modelName, file),
+          size: stats.size,
+          type: path.extname(file).toLowerCase().slice(1) || "bin",
+        };
+      }),
+  );
+
+  const manifest = {
+    version: 3,
+    strategy: "hybrid_overview_tiles",
+    modelName,
+    delivery: {
+      transport: "http-pull",
+      bootstrapFormat: "json",
+      overviewFormat: "glb",
+      tileFormat: "glb",
+    },
+    renderer: "filament",
+    intendedClient: "mobile",
+    acceptedUploadFormats: ["zip:gltf-package", "zip:glb-package", "glb"],
+    entryStage: entryStage?.id || null,
+    upgradeOrder,
+    bootstrap: {
+      url: `/stream-bootstrap/${modelName}`,
+      firstFrameStageId: entryStage?.id || null,
+      firstFrameUrl: entryStage?.url || null,
+      firstFrameSize: entryStage?.size || 0,
+      overviewUpgradeOrder: upgradeOrder,
+      rootTileCount: rootTiles.length,
+    },
+    scene: {
+      bounds: sceneBounds,
+      stats: sourceStats,
+    },
+    overview: {
+      activeStageLimit: 1,
+      stages: overviewStages.map((stage) => ({
+        ...stage,
+        firstFrameCandidate: stage.id === entryStage?.id,
+      })),
+    },
+    tiles: detailTiles,
+    rootTiles,
+    tileTraversalOrder: detailTilePlan.traversalOrder,
+    sharedResources,
+    clientBudgets: {
+      recommendedMaxResidentOverviewStages: 1,
+      recommendedMaxActiveTiles: Math.min(Math.max(rootTiles.length * 4, 12), 48),
+      recommendedConcurrentTileRequests: 4,
+    },
+    hints: {
+      notes: [
+        "Load the lightest overview stage first for fastest first frame.",
+        "Keep a single overview stage resident while detail tiles progressively replace visible regions.",
+        "Prioritize root tiles first, then descend into children using camera distance, bounds radius and screen coverage.",
+      ],
+    },
+    generatedAt: new Date().toISOString(),
+  };
+
+  await fsp.writeFile(
+    path.join(modelDir, "stream.manifest.json"),
+    JSON.stringify(manifest, null, 2),
+  );
+
+  return manifest;
+}
+
+async function writeModelMetadata(modelName, modelDir, manifest) {
+  const entryStage =
+    manifest.overview.stages.find((stage) => stage.id === manifest.entryStage) ||
+    manifest.overview.stages[manifest.overview.stages.length - 1] ||
+    manifest.overview.stages[0];
+  const stats = await fsp.stat(path.join(modelDir, entryStage.file));
+  const totalSize = await getDirectorySize(modelDir);
+  const metadata = {
+    modelName,
+    type: "mesh-stream-package",
+    entryFile: entryStage.file,
+    entryUrl: entryStage.url,
+    assetDirectory: buildModelAssetDirectory(modelName),
+    manifestUrl: buildModelAssetUrl(modelName, "stream.manifest.json"),
+    bootstrapUrl: `/stream-bootstrap/${modelName}`,
+    streamingStrategy: manifest.strategy,
+    entryStage: manifest.entryStage,
+    upgradeOrder: manifest.upgradeOrder,
+    overviewStages: manifest.overview.stages,
+    tileCount: manifest.tiles.length,
+    sceneBounds: manifest.scene.bounds,
+    sceneStats: manifest.scene.stats,
+    size: totalSize,
+    sizeInMB: parseFloat((totalSize / 1024 / 1024).toFixed(2)),
+    created: new Date().toISOString(),
+    entryModified: stats.mtime,
+  };
+
+  await fsp.writeFile(
+    path.join(METADATA_DIR, `${modelName}.json`),
+    JSON.stringify(metadata, null, 2),
+  );
+
+  return metadata;
+}
+
+function pushUploadLog(message, phase = uploadStatus.phase) {
+  const now = new Date().toISOString();
+  uploadStatus.active =
+    phase !== "done" && phase !== "error" && phase !== "idle";
+  uploadStatus.phase = phase;
+  uploadStatus.message = message;
+  uploadStatus.updatedAt = now;
+  if (!uploadStatus.startedAt && uploadStatus.active) {
+    uploadStatus.startedAt = now;
+  }
+  uploadStatus.logs.push({ time: now, phase, message });
+  uploadStatus.logs = uploadStatus.logs.slice(-30);
+  console.log(`[upload:${phase}] ${message}`);
+}
+
+function resetUploadStatus() {
+  uploadStatus.active = false;
+  uploadStatus.phase = "idle";
+  uploadStatus.message = "Žádný aktivní upload.";
+  uploadStatus.startedAt = null;
+  uploadStatus.updatedAt = new Date().toISOString();
+  uploadStatus.logs = [];
+}
+
+const io = new NodeIO().registerExtensions(ALL_EXTENSIONS);
 
 function addImageIndexFromTextureInfo(gltf, imageSet, textureInfo) {
   if (!textureInfo || !Number.isInteger(textureInfo.index)) {
@@ -206,103 +967,7 @@ function collectDataTextureImageIndices(gltf) {
   return dataTextureImages;
 }
 
-// CHUNKING SYSTÉM
-
-async function createChunks(modelPath, modelName) {
-  const modelDir = path.join(CHUNKS_DIR, modelName.replace(".glb", ""));
-
-  await fsp.rm(modelDir, { recursive: true, force: true });
-  await fsp.mkdir(modelDir, { recursive: true });
-
-  const stats = await fsp.stat(modelPath);
-  const fileSize = stats.size;
-  const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
-
-  console.log(`Vytvářím ${totalChunks} chunků pro ${modelName}...`);
-
-  const chunkHashes = [];
-  let totalOriginalSize = 0;
-  let totalCompressedSize = 0;
-  const fileHandle = await fsp.open(modelPath, "r");
-
-  for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
-    const chunkPath = path.join(modelDir, `chunk_${chunkIndex}.bin`);
-    const gzipPath = chunkPath + ".gz";
-    const start = chunkIndex * CHUNK_SIZE;
-    const bytesToRead = Math.min(CHUNK_SIZE, fileSize - start);
-    const chunkBuffer = Buffer.allocUnsafe(bytesToRead);
-
-    try {
-      const { bytesRead } = await fileHandle.read(
-        chunkBuffer,
-        0,
-        bytesToRead,
-        start,
-      );
-      const chunk =
-        bytesRead === bytesToRead
-          ? chunkBuffer
-          : chunkBuffer.subarray(0, bytesRead);
-
-      await fsp.writeFile(chunkPath, chunk);
-
-      const compressed = await gzip(chunk, { level: 9 });
-      await fsp.writeFile(gzipPath, compressed);
-
-      const chunkHash = crypto.createHash("sha256").update(chunk).digest("hex");
-
-      chunkHashes.push(chunkHash);
-      totalOriginalSize += chunk.length;
-      totalCompressedSize += compressed.length;
-
-      if (chunkIndex % 10 === 0) {
-        const savings = ((1 - compressed.length / chunk.length) * 100).toFixed(
-          1,
-        );
-        console.log(
-          `  Chunk ${chunkIndex}: ${(chunk.length / 1024).toFixed(0)}KB → ${(compressed.length / 1024).toFixed(0)}KB (${savings}% úspora)`,
-        );
-      }
-    } catch (err) {
-      await fileHandle.close();
-      throw err;
-    }
-  }
-
-  await fileHandle.close();
-
-  const fileHash = await calculateFileHash(modelPath);
-
-  const metadata = {
-    modelName,
-    totalChunks,
-    chunkSize: CHUNK_SIZE,
-    totalSize: fileSize,
-    fileHash,
-    chunkHashes,
-    compressed: true,
-    compressionStats: {
-      originalSize: totalOriginalSize,
-      compressedSize: totalCompressedSize,
-      ratio: ((1 - totalCompressedSize / totalOriginalSize) * 100).toFixed(1),
-    },
-    created: new Date().toISOString(),
-  };
-
-  const metadataPath = path.join(METADATA_DIR, `${modelName}.json`);
-  await fsp.writeFile(metadataPath, JSON.stringify(metadata, null, 2));
-
-  const compressionRatio = (
-    (1 - totalCompressedSize / totalOriginalSize) *
-    100
-  ).toFixed(1);
-  console.log(`Chunky vytvořeny: ${totalChunks} chunks`);
-  console.log(
-    `Komprese: ${(totalOriginalSize / 1024 / 1024).toFixed(2)}MB → ${(totalCompressedSize / 1024 / 1024).toFixed(2)}MB (${compressionRatio}% úspora)`,
-  );
-
-  return metadata;
-}
+// Legacy chunk endpointy jsou vypnuté. Backend nyní generuje overview + detail tiles.
 
 // OPTIMALIZACE TEXTUR
 
@@ -347,11 +1012,13 @@ async function optimizeTextures(gltfPath, resourceDir) {
 
         let maxSize;
         if (imgMeta.width > 4096 || imgMeta.height > 4096) {
-          maxSize = 2048;
-        } else if (imgMeta.width > 2048 || imgMeta.height > 2048) {
-          maxSize = 2048;
-        } else if (imgMeta.width > 1024 || imgMeta.height > 1024) {
           maxSize = 1024;
+        } else if (imgMeta.width > 2048 || imgMeta.height > 2048) {
+          maxSize = 1024;
+        } else if (imgMeta.width > 1024 || imgMeta.height > 1024) {
+          maxSize = 512;
+        } else if (imgMeta.width > 512 || imgMeta.height > 512) {
+          maxSize = 512;
         } else {
           maxSize = imgMeta.width;
         }
@@ -374,14 +1041,14 @@ async function optimizeTextures(gltfPath, resourceDir) {
 
         if (useJpeg) {
           pipeline = pipeline.jpeg({
-            quality: 85,
+            quality: 72,
             mozjpeg: true,
             chromaSubsampling: "4:2:0",
           });
         } else {
           pipeline = pipeline.png({
             compressionLevel: 9,
-            palette: !hasAlpha,
+            palette: true,
           });
         }
 
@@ -441,29 +1108,229 @@ async function optimizeTextures(gltfPath, resourceDir) {
   }
 }
 
-// UPLOAD ENDPOINT
+// BUN SERVER
 
-const uploadZip = multer({ storage: multer.memoryStorage() });
+function jsonResponse(data, status = 200, headers = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      ...headers,
+    },
+  });
+}
 
-app.post("/upload-model", uploadZip.single("modelZip"), async (req, res) => {
-  let tempDir = null;
+async function pathExists(targetPath) {
+  try {
+    await fsp.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-  const cleanup = () => {
-    if (tempDir) {
-      fs.rm(tempDir, { recursive: true, force: true }, (err) => {
-        if (err) console.error(`Chyba při mazání ${tempDir}:`, err);
+async function saveUploadedSource(request, targetDir) {
+  if (!request.body) {
+    throw new Error("Požadavek neobsahuje upload data.");
+  }
+
+  const contentType = request.headers.get("content-type") || "";
+  if (!contentType.toLowerCase().includes("multipart/form-data")) {
+    throw new Error("Upload musí být multipart/form-data.");
+  }
+
+  const headers = Object.fromEntries(request.headers.entries());
+
+  return new Promise((resolve, reject) => {
+    const busboy = Busboy({
+      headers,
+      limits: {
+        files: 1,
+        fileSize: MAX_UPLOAD_SIZE,
+      },
+    });
+
+    let fileFound = false;
+    let fileWritePromise = null;
+    let uploadError = null;
+    let uploadedFilePath = null;
+    let uploadedFileName = null;
+
+    busboy.on("file", (fieldName, file, info) => {
+      if (fieldName !== "modelZip") {
+        file.resume();
+        return;
+      }
+
+      if (fileFound) {
+        uploadError = new Error("Je povolen pouze jeden soubor modelu.");
+        file.resume();
+        return;
+      }
+
+      fileFound = true;
+
+      const extension = path.extname(info.filename || "").toLowerCase();
+      if (extension !== ".zip" && extension !== ".glb") {
+        uploadError = new Error(
+          "Nahraný soubor musí mít příponu .zip nebo .glb.",
+        );
+        file.resume();
+        return;
+      }
+
+      uploadedFileName = info.filename || `upload${extension}`;
+      uploadedFilePath = path.join(targetDir, uploadedFileName);
+
+      file.on("limit", () => {
+        uploadError = new Error("Nahraný soubor je příliš velký.");
       });
+
+      const output = fs.createWriteStream(uploadedFilePath);
+      fileWritePromise = pipeline(file, output);
+      fileWritePromise.catch((err) => {
+        uploadError ??= err;
+      });
+    });
+
+    busboy.on("filesLimit", () => {
+      uploadError = new Error("Je povolen pouze jeden soubor modelu.");
+    });
+
+    busboy.on("error", reject);
+
+    busboy.on("close", async () => {
+      try {
+        if (!fileFound) {
+          throw new Error("Nebyl nahrán žádný soubor modelu.");
+        }
+
+        if (fileWritePromise) {
+          await fileWritePromise;
+        }
+
+        if (uploadError) {
+          throw uploadError;
+        }
+
+        resolve({
+          filePath: uploadedFilePath,
+          fileName: uploadedFileName,
+          extension: path.extname(uploadedFileName).toLowerCase(),
+        });
+      } catch (err) {
+        reject(err);
+      }
+    });
+
+    pipeline(Readable.fromWeb(request.body), busboy).catch(reject);
+  });
+}
+
+async function extractZipArchive(zipPath, targetDir) {
+  await fs
+    .createReadStream(zipPath)
+    .pipe(unzipper.Extract({ path: targetDir }))
+    .promise();
+}
+
+async function normalizeSourceToGltfPackage(sourcePath, workspaceDir) {
+  const extension = path.extname(sourcePath).toLowerCase();
+
+  if (extension === ".gltf") {
+    return sourcePath;
+  }
+
+  if (extension !== ".glb") {
+    throw new Error("Nepodporovaný vstupní formát modelu.");
+  }
+
+  const modelName = path.parse(sourcePath).name;
+  const normalizedPath = path.join(workspaceDir, `${modelName}.gltf`);
+  const document = await io.read(sourcePath);
+  await io.write(normalizedPath, document);
+  return normalizedPath;
+}
+
+function decodeParam(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function resolvePublicPath(pathname) {
+  const safePathname = pathname.replace(/%5c/gi, "/").replace(/\\/g, "/");
+  const normalized =
+    safePathname === "/" ? "index.html" : safePathname.replace(/^\/+/, "");
+  const resolved = path.resolve(PUBLIC_DIR, normalized);
+
+  if (
+    resolved !== PUBLIC_DIR &&
+    !resolved.startsWith(`${PUBLIC_DIR}${path.sep}`)
+  ) {
+    return null;
+  }
+
+  return resolved;
+}
+
+async function serveStatic(pathname) {
+  const resolvedPath = resolvePublicPath(pathname);
+
+  if (!resolvedPath) {
+    return jsonResponse(
+      { success: false, message: "Soubor nebyl nalezen." },
+      404,
+    );
+  }
+
+  try {
+    const stats = await fsp.stat(resolvedPath);
+    if (!stats.isFile()) {
+      return jsonResponse(
+        { success: false, message: "Soubor nebyl nalezen." },
+        404,
+      );
+    }
+
+    const file = Bun.file(resolvedPath);
+    const headers = new Headers({
+      "Cache-Control":
+        pathname === "/" ? "no-cache" : "public, max-age=31536000",
+    });
+
+    if (file.type) {
+      headers.set("Content-Type", file.type);
+    }
+
+    return new Response(file, { headers });
+  } catch {
+    return jsonResponse(
+      { success: false, message: "Soubor nebyl nalezen." },
+      404,
+    );
+  }
+}
+
+async function handleUploadModel(request) {
+  let tempDir = null;
+  let uploadedSource = null;
+
+  const cleanup = async () => {
+    if (tempDir) {
+      try {
+        await fsp.rm(tempDir, { recursive: true, force: true });
+      } catch (err) {
+        console.error(`Chyba při mazání ${tempDir}:`, err);
+      }
     }
   };
 
   try {
-    if (!req.file) {
-      return res.status(400).json({
-        success: false,
-        message: "Nebyl nahrán žádný ZIP soubor.",
-      });
-    }
-
+    resetUploadStatus();
+    pushUploadLog("Upload zahájen.", "uploading");
     console.log("\n" + "=".repeat(60));
     console.log("NOVÝ MODEL - Zpracování začíná");
     console.log("=".repeat(60));
@@ -471,535 +1338,592 @@ app.post("/upload-model", uploadZip.single("modelZip"), async (req, res) => {
     const tempDirPrefix = path.join(UPLOAD_DIR, "model-");
     tempDir = fs.mkdtempSync(tempDirPrefix);
 
-    const zip = new AdmZip(req.file.buffer);
-    zip.extractAllTo(tempDir, true);
-    console.log("ZIP soubor rozbalen");
+    uploadedSource = await saveUploadedSource(request, tempDir);
 
-    const allFiles = await getAllFiles(tempDir);
-    const gltfFilePath = allFiles.find((f) =>
-      f.toLowerCase().endsWith(".gltf"),
-    );
+    let gltfFilePath = null;
 
-    if (!gltfFilePath) {
-      cleanup();
-      return res.status(400).json({
-        success: false,
-        message: "ZIP musí obsahovat .gltf soubor!",
-      });
+    if (uploadedSource.extension === ".zip") {
+      pushUploadLog(
+        "ZIP soubor uložen na disk, rozbaluji archiv.",
+        "extracting",
+      );
+      await extractZipArchive(uploadedSource.filePath, tempDir);
+      console.log("ZIP soubor rozbalen");
+
+      const allFiles = await getAllFiles(tempDir);
+      const sourceModelPath =
+        allFiles.find((file) => file.toLowerCase().endsWith(".gltf")) ||
+        allFiles.find((file) => file.toLowerCase().endsWith(".glb"));
+
+      if (!sourceModelPath) {
+        await cleanup();
+        return jsonResponse(
+          {
+            success: false,
+            message: "ZIP musí obsahovat .gltf nebo .glb soubor!",
+          },
+          400,
+        );
+      }
+
+      if (sourceModelPath.toLowerCase().endsWith(".glb")) {
+        pushUploadLog(
+          `GLB nalezen: ${path.basename(sourceModelPath)}. Převádím ho na GLTF package.`,
+          "converting",
+        );
+      }
+
+      gltfFilePath = await normalizeSourceToGltfPackage(sourceModelPath, tempDir);
+    } else {
+      pushUploadLog(
+        `GLB soubor uložen na disk: ${uploadedSource.fileName}. Převádím ho na GLTF package.`,
+        "converting",
+      );
+      gltfFilePath = await normalizeSourceToGltfPackage(
+        uploadedSource.filePath,
+        tempDir,
+      );
     }
 
     console.log(`GLTF nalezen: ${path.basename(gltfFilePath)}`);
+    pushUploadLog(
+      `GLTF nalezen: ${path.basename(gltfFilePath)}. Optimalizuji textury.`,
+      "optimizing",
+    );
 
     const resourceDir = path.dirname(gltfFilePath);
     const modelName = path.parse(gltfFilePath).name;
-    const outputName = `${modelName}.glb`;
-    const outputPath = path.join(MODELS_DIR, outputName);
+    const outputDir = path.join(MODELS_DIR, modelName);
 
     console.log("\nOptimalizace textur");
-    const gltf = await optimizeTextures(gltfFilePath, resourceDir);
-
-    console.log("Draco komprese a balení");
-    const options = {
-      resourceDirectory: resourceDir,
-      dracoOptions: {
-        compressionLevel: 10,
-        quantizePositionBits: 11,
-        quantizeNormalBits: 8,
-        quantizeTexcoordBits: 10,
-        quantizeColorBits: 8,
-        quantizeGenericBits: 8,
-        unifiedQuantization: true,
-      },
-    };
-
-    const results = await gltfToGlb(gltf, options);
-    await fsp.writeFile(outputPath, results.glb);
-
-    const finalSizeMB = (results.glb.length / 1024 / 1024).toFixed(2);
-
-    console.log("\nVytváření chunků");
-    const metadata = await createChunks(outputPath, outputName);
+    await optimizeTextures(gltfFilePath, resourceDir);
+    const sourceDocument = await io.read(gltfFilePath);
+    pushUploadLog(
+      "Textury hotové. Generuji overview stages, detail tiles a klientský bootstrap manifest.",
+      "saving",
+    );
+    await fsp.rm(outputDir, { recursive: true, force: true });
+    await fsp.mkdir(outputDir, { recursive: true });
+    const manifest = await buildStreamingPackage(
+      modelName,
+      sourceDocument,
+      outputDir,
+    );
+    const metadata = await writeModelMetadata(modelName, outputDir, manifest);
 
     console.log("\n" + "=".repeat(60));
-    console.log(`HOTOVO!`);
-    console.log(`Model: ${outputName}`);
-    console.log(`Velikost: ${finalSizeMB} MB`);
-    console.log(`Chunky: ${metadata.totalChunks}`);
+    console.log("HOTOVO!");
+    console.log(`Model: ${modelName}`);
+    console.log(`Entry Stage: ${metadata.entryStage}`);
+    console.log(
+      `Overview stages: ${manifest.overview.stages.map((stage) => stage.file).join(", ")}`,
+    );
+    console.log(`Detail tiles: ${manifest.tiles.length}`);
+    console.log(`Velikost: ${metadata.sizeInMB} MB`);
     console.log("=".repeat(60) + "\n");
 
-    cleanup();
+    await cleanup();
+    pushUploadLog(
+      `Hotovo: ${modelName}, overview stages ${manifest.overview.stages.length}, detail tiles ${manifest.tiles.length}.`,
+      "done",
+    );
 
-    res.json({
+    return jsonResponse({
       success: true,
-      message: `Model ${outputName} byl úspěšně zpracován.`,
-      fileName: outputName,
-      sizeInMB: parseFloat(finalSizeMB),
-      path: `/models/${outputName}`,
-      chunked: true,
-      metadata: {
-        totalChunks: metadata.totalChunks,
-        chunkSize: metadata.chunkSize,
-        fileHash: metadata.fileHash,
-      },
+      message: `Model ${modelName} byl úspěšně zpracován.`,
+      fileName: metadata.entryFile,
+      modelName,
+      sizeInMB: metadata.sizeInMB,
+      path: metadata.entryUrl,
+      manifestUrl: metadata.manifestUrl,
+      chunked: false,
+      metadata,
     });
   } catch (err) {
     console.error("\nCHYBA při zpracování:", err);
-    cleanup();
+    await cleanup();
 
-    if (!res.headersSent) {
-      res.status(500).json({
+    const clientErrors = new Set([
+      "Nebyl nahrán žádný soubor modelu.",
+      "Nahraný soubor musí mít příponu .zip nebo .glb.",
+      "Nahraný soubor je příliš velký.",
+      "Upload musí být multipart/form-data.",
+      "Je povolen pouze jeden soubor modelu.",
+      "Požadavek neobsahuje upload data.",
+      "Nepodporovaný vstupní formát modelu.",
+    ]);
+
+    pushUploadLog(
+      clientErrors.has(err.message)
+        ? err.message
+        : "Zpracování modelu selhalo.",
+      "error",
+    );
+
+    return jsonResponse(
+      {
         success: false,
-        message: "Chyba při zpracování modelu.",
+        message: clientErrors.has(err.message)
+          ? err.message
+          : "Chyba při zpracování modelu.",
         error: err.message,
-      });
-    }
+      },
+      clientErrors.has(err.message) ? 400 : 500,
+    );
   }
-});
+}
 
-// CHUNK ENDPOINTS S GZIP PODPOROU
-
-app.get("/model-metadata/:modelName", async (req, res) => {
-  const modelName = req.params.modelName;
+async function handleModelMetadata(modelName) {
   const metadataPath = path.join(METADATA_DIR, `${modelName}.json`);
 
   try {
     const metadataContent = await fsp.readFile(metadataPath, "utf8");
-    const metadata = JSON.parse(metadataContent);
-    res.json({
+    const metadata = normalizeStreamingPayload(JSON.parse(metadataContent));
+
+    return jsonResponse({
       success: true,
       metadata,
     });
   } catch {
-    return res.status(404).json({
-      success: false,
-      message: "Metadata nenalezena.",
-    });
-  }
-});
-
-app.get("/download-chunk/:modelName/:chunkIndex", async (req, res) => {
-  const { modelName, chunkIndex } = req.params;
-  const modelDir = path.join(CHUNKS_DIR, modelName.replace(".glb", ""));
-  const chunkPath = path.join(modelDir, `chunk_${chunkIndex}.bin`);
-  const gzipPath = chunkPath + ".gz";
-
-  try {
-    const stats = await fsp.stat(chunkPath);
-    const acceptEncoding = req.headers["accept-encoding"] || "";
-    let responsePath = chunkPath;
-    let responseStats = stats;
-    let useGzip = false;
-
-    try {
-      if (acceptEncoding.includes("gzip")) {
-        const gzipStats = await fsp.stat(gzipPath);
-        console.log(`Sending compressed chunk ${chunkIndex} for ${modelName}`);
-        responsePath = gzipPath;
-        responseStats = gzipStats;
-        useGzip = true;
-      }
-    } catch {}
-
-    const etag = `"${responseStats.size}-${responseStats.mtime.getTime()}-${useGzip ? "gzip" : "identity"}"`;
-
-    res.setHeader("ETag", etag);
-    res.setHeader("Vary", "Accept-Encoding");
-    res.setHeader("Cache-Control", "public, max-age=31536000");
-    res.setHeader("Content-Type", "application/octet-stream");
-    res.setHeader("X-Original-Size", stats.size);
-    res.setHeader("X-Chunk-Compressed", useGzip ? "true" : "false");
-
-    if (useGzip) {
-      res.setHeader("Content-Encoding", "gzip");
-      res.setHeader("X-Compressed-Size", responseStats.size);
-    }
-
-    if (req.headers["if-none-match"] === etag) {
-      return res.status(304).end();
-    }
-
-    console.log(
-      `Sending ${useGzip ? "compressed" : "uncompressed"} chunk ${chunkIndex} for ${modelName}`,
+    return jsonResponse(
+      {
+        success: false,
+        message: "Metadata nenalezena.",
+      },
+      404,
     );
-    res.sendFile(responsePath);
+  }
+}
+
+async function handleStreamManifest(modelName) {
+  try {
+    const manifestContent = await fsp.readFile(
+      path.join(MODELS_DIR, modelName, "stream.manifest.json"),
+      "utf8",
+    );
+    const manifest = normalizeStreamingPayload(JSON.parse(manifestContent));
+
+    return new Response(JSON.stringify(manifest), {
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "public, max-age=31536000",
+      },
+    });
   } catch {
-    return res.status(404).json({
-      success: false,
-      message: "Chunk nenalezen.",
-    });
-  }
-});
-
-// SEZNAM MODELŮ
-
-app.get("/models", async (req, res) => {
-  try {
-    const files = await fsp.readdir(MODELS_DIR);
-    const glbFiles = files.filter(
-      (file) => path.extname(file).toLowerCase() === ".glb",
+    return jsonResponse(
+      {
+        success: false,
+        message: "Streaming manifest nenalezen.",
+      },
+      404,
     );
+  }
+}
 
-    const modelTasks = glbFiles.map(async (file) => {
-      const filePath = path.join(MODELS_DIR, file);
-      const stats = await fsp.stat(filePath);
+async function handleStreamBootstrap(modelName) {
+  try {
+    const [metadataContent, manifestContent] = await Promise.all([
+      fsp.readFile(path.join(METADATA_DIR, `${modelName}.json`), "utf8"),
+      fsp.readFile(path.join(MODELS_DIR, modelName, "stream.manifest.json"), "utf8"),
+    ]);
 
-      const metadataPath = path.join(METADATA_DIR, `${file}.json`);
-      let chunked = false;
-      let totalChunks = 0;
+    const metadata = normalizeStreamingPayload(JSON.parse(metadataContent));
+    const manifest = normalizeStreamingPayload(JSON.parse(manifestContent));
 
-      try {
-        const metadataContent = await fsp.readFile(metadataPath, "utf8");
-        const metadata = JSON.parse(metadataContent);
-        chunked = true;
-        totalChunks = metadata.totalChunks;
-      } catch {}
+    return jsonResponse({
+      success: true,
+      modelName,
+      bootstrap: {
+        strategy: manifest.strategy,
+        metadata,
+        manifest,
+      },
+    });
+  } catch {
+    return jsonResponse(
+      {
+        success: false,
+        message: "Streaming bootstrap nenalezen.",
+      },
+      404,
+    );
+  }
+}
+
+function handleUploadStatus() {
+  return jsonResponse({
+    success: true,
+    status: uploadStatus,
+  });
+}
+
+async function handleDownloadChunk(request, modelName, chunkIndex) {
+  return jsonResponse(
+    {
+      success: false,
+      message: "Legacy chunk endpoint je vypnutý. Použij stream manifest a detail tiles z custom mesh streaming pipeline.",
+      model: modelName,
+      chunkIndex,
+    },
+    410,
+  );
+}
+
+async function handleModelsList() {
+  try {
+    const files = await fsp.readdir(METADATA_DIR);
+    const metadataFiles = files.filter((file) => file.toLowerCase().endsWith(".json"));
+
+    const modelTasks = metadataFiles.map(async (file) => {
+      const metadataPath = path.join(METADATA_DIR, file);
+      const metadataContent = await fsp.readFile(metadataPath, "utf8");
+      const metadata = normalizeStreamingPayload(JSON.parse(metadataContent));
+      const stats = await fsp.stat(metadataPath);
+
+      if (!metadata.entryFile || !metadata.entryUrl) {
+        return null;
+      }
 
       return {
-        name: file,
-        size: stats.size,
-        sizeInMB: parseFloat((stats.size / 1024 / 1024).toFixed(2)),
-        created: stats.birthtime,
+        name: metadata.modelName,
+        entryFile: metadata.entryFile,
+        entryUrl: metadata.entryUrl,
+        assetDirectory: metadata.assetDirectory,
+        manifestUrl: metadata.manifestUrl,
+        bootstrapUrl: metadata.bootstrapUrl,
+        streamingStrategy: metadata.streamingStrategy,
+        upgradeOrder: metadata.upgradeOrder || [],
+        overviewStageCount: (metadata.overviewStages || []).length,
+        tileCount: metadata.tileCount || 0,
+        type: metadata.type || "gltf",
+        size: metadata.size,
+        sizeInMB: metadata.sizeInMB,
+        created: metadata.created || stats.birthtime,
         modified: stats.mtime,
-        chunked,
-        totalChunks,
+        chunked: false,
+        totalChunks: 0,
       };
     });
 
-    const models = await Promise.all(modelTasks);
-    models.sort((a, b) => b.modified - a.modified);
+    const models = (await Promise.all(modelTasks)).filter(Boolean);
+    models.sort((a, b) => new Date(b.modified) - new Date(a.modified));
 
-    res.json({
+    return jsonResponse({
       success: true,
       count: models.length,
-      models: models,
+      models,
     });
   } catch (err) {
     console.error("Chyba při čtení modelů:", err);
-    res.status(500).json({
-      success: false,
-      message: "Chyba serveru.",
-    });
+
+    return jsonResponse(
+      {
+        success: false,
+        message: "Chyba serveru.",
+      },
+      500,
+    );
   }
-});
+}
 
-// DOWNLOAD ENDPOINT
-
-app.get("/download-model/:modelName", async (req, res) => {
-  const modelName = req.params.modelName;
-  const filePath = path.join(MODELS_DIR, modelName);
-
+async function handleDownloadModel(request, modelName) {
   try {
-    const stat = await fsp.stat(filePath);
-    const fileSize = stat.size;
-    const etag = `"${fileSize}-${stat.mtime.getTime()}"`;
+    const metadataContent = await fsp.readFile(
+      path.join(METADATA_DIR, `${modelName}.json`),
+      "utf8",
+    );
+    const metadata = normalizeStreamingPayload(JSON.parse(metadataContent));
 
-    res.setHeader("ETag", etag);
-
-    if (req.headers["if-none-match"] === etag) {
-      return res.status(304).end();
-    }
-
-    const range = req.headers.range;
-
-    if (range) {
-      const parts = range.replace(/bytes=/, "").split("-");
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-      const chunksize = end - start + 1;
-
-      const file = fs.createReadStream(filePath, { start, end });
-
-      res.writeHead(206, {
-        "Content-Range": `bytes ${start}-${end}/${fileSize}`,
-        "Accept-Ranges": "bytes",
-        "Content-Length": chunksize,
-        "Content-Type": "model/gltf-binary",
-        ETag: etag,
-        "Cache-Control": "public, max-age=31536000",
-      });
-
-      file.pipe(res);
-    } else {
-      res.writeHead(200, {
-        "Content-Length": fileSize,
-        "Content-Type": "model/gltf-binary",
-        "Content-Disposition": `attachment; filename="${modelName}"`,
-        ETag: etag,
-        "Cache-Control": "public, max-age=31536000",
-      });
-
-      fs.createReadStream(filePath).pipe(res);
-    }
+    return Response.redirect(new URL(metadata.entryUrl, request.url), 302);
   } catch {
-    return res.status(404).json({
-      success: false,
-      message: "Model nebyl nalezen.",
-    });
+    return jsonResponse(
+      {
+        success: false,
+        message: "Model nebyl nalezen.",
+      },
+      404,
+    );
   }
-});
+}
 
-// MODEL INFO
-
-app.get("/model-info/:modelName", async (req, res) => {
-  const modelName = req.params.modelName;
-  const filePath = path.join(MODELS_DIR, modelName);
-
+async function handleModelInfo(modelName) {
   try {
-    const stats = await fsp.stat(filePath);
-
     const metadataPath = path.join(METADATA_DIR, `${modelName}.json`);
-    let metadata = null;
+    const metadataContent = await fsp.readFile(metadataPath, "utf8");
+    const metadata = normalizeStreamingPayload(JSON.parse(metadataContent));
+    const stats = await fsp.stat(metadataPath);
 
-    try {
-      const metadataContent = await fsp.readFile(metadataPath, "utf8");
-      metadata = JSON.parse(metadataContent);
-    } catch {}
-
-    res.json({
+    return jsonResponse({
       success: true,
       model: {
         name: modelName,
-        size: stats.size,
-        sizeInMB: parseFloat((stats.size / 1024 / 1024).toFixed(2)),
-        created: stats.birthtime,
+        type: metadata.type || "gltf",
+        entryFile: metadata.entryFile,
+        entryUrl: metadata.entryUrl,
+        manifestUrl: metadata.manifestUrl,
+        bootstrapUrl: metadata.bootstrapUrl,
+        streamingStrategy: metadata.streamingStrategy,
+        size: metadata.size,
+        sizeInMB: metadata.sizeInMB,
+        created: metadata.created || stats.birthtime,
         modified: stats.mtime,
         downloadUrl: `/download-model/${modelName}`,
-        chunked: metadata !== null,
-        metadata: metadata,
+        chunked: false,
+        overviewStageCount: (metadata.overviewStages || []).length,
+        tileCount: metadata.tileCount || 0,
+        metadata,
       },
     });
   } catch {
-    return res.status(404).json({
-      success: false,
-      message: "Model nebyl nalezen.",
-    });
-  }
-});
-
-// VYTVOŘENÍ CHUNKŮ PRO EXISTUJÍCÍ MODELY
-
-app.post("/create-chunks/:modelName", async (req, res) => {
-  const modelName = req.params.modelName;
-  const modelPath = path.join(MODELS_DIR, modelName);
-
-  try {
-    await fsp.access(modelPath);
-  } catch {
-    return res.status(404).json({
-      success: false,
-      message: "Model nebyl nalezen.",
-    });
-  }
-
-  try {
-    console.log(`\nVytváření chunků pro: ${modelName}`);
-    const metadata = await createChunks(modelPath, modelName);
-
-    res.json({
-      success: true,
-      message: `Chunky vytvořeny pro ${modelName}`,
-      metadata: {
-        totalChunks: metadata.totalChunks,
-        chunkSize: metadata.chunkSize,
-        fileHash: metadata.fileHash,
+    return jsonResponse(
+      {
+        success: false,
+        message: "Model nebyl nalezen.",
       },
-    });
-  } catch (err) {
-    console.error("Chyba:", err);
-    res.status(500).json({
-      success: false,
-      message: "Chyba při vytváření chunků.",
-      error: err.message,
-    });
+      404,
+    );
   }
-});
+}
 
-app.post("/create-all-chunks", async (req, res) => {
-  try {
-    const files = await fsp.readdir(MODELS_DIR);
-    const glbFiles = files.filter((f) => f.toLowerCase().endsWith(".glb"));
-
-    const results = [];
-
-    for (const file of glbFiles) {
-      const metadataPath = path.join(METADATA_DIR, `${file}.json`);
-
-      try {
-        await fsp.access(metadataPath);
-        results.push({
-          model: file,
-          status: "skipped",
-          message: "Již má chunky",
-        });
-        continue;
-      } catch {}
-
-      try {
-        const modelPath = path.join(MODELS_DIR, file);
-        console.log(`\nVytváření chunků pro: ${file}`);
-        await createChunks(modelPath, file);
-
-        results.push({
-          model: file,
-          status: "success",
-          message: "Chunky vytvořeny",
-        });
-      } catch (err) {
-        console.error(`Chyba při vytváření chunků pro ${file}:`, err);
-        results.push({
-          model: file,
-          status: "error",
-          message: err.message,
-        });
-      }
-    }
-
-    res.json({
-      success: true,
-      message: `Zpracováno ${glbFiles.length} modelů`,
-      results,
-    });
-  } catch (err) {
-    console.error("❌ Chyba:", err);
-    res.status(500).json({
+async function handleCreateChunks(modelName) {
+  return jsonResponse(
+    {
       success: false,
-      message: "Chyba při vytváření chunků.",
-      error: err.message,
-    });
-  }
-});
+      message: "Legacy chunking je vypnutý. Použij stream manifest, overview stages a detail tiles.",
+      model: modelName,
+    },
+    400,
+  );
+}
 
-// SMAZÁNÍ MODELU
-
-app.delete("/model/:modelName", async (req, res) => {
-  const modelName = req.params.modelName;
-  const filePath = path.join(MODELS_DIR, modelName);
-
-  try {
-    await fsp.access(filePath);
-  } catch {
-    return res.status(404).json({
+async function handleCreateAllChunks() {
+  return jsonResponse(
+    {
       success: false,
-      message: "Model nebyl nalezen.",
-    });
+      message: "Legacy chunking je vypnutý. Použij stream manifest, overview stages a detail tiles.",
+      results: [],
+    },
+    400,
+  );
+}
+
+async function handleDeleteModel(modelName) {
+  const modelDir = path.join(MODELS_DIR, modelName);
+  const metadataPath = path.join(METADATA_DIR, `${modelName}.json`);
+
+  if (!(await pathExists(modelDir)) && !(await pathExists(metadataPath))) {
+    return jsonResponse(
+      {
+        success: false,
+        message: "Model nebyl nalezen.",
+      },
+      404,
+    );
   }
 
   try {
-    // Připrav všechny cesty k souborům
-    const modelDir = path.join(CHUNKS_DIR, modelName.replace(".glb", ""));
-    const metadataPath = path.join(METADATA_DIR, `${modelName}.json`);
-
-    // Smaž vše
-    const deleteOps = [
-      fsp.unlink(filePath),
+    await Promise.all([
       fsp.rm(modelDir, { recursive: true, force: true }).catch(() => {}),
       fsp.unlink(metadataPath).catch(() => {}),
-    ];
+    ]);
 
-    await Promise.all(deleteOps);
-
-    res.json({
+    return jsonResponse({
       success: true,
       message: `Model ${modelName} byl smazán.`,
     });
   } catch (err) {
     console.error("Chyba při mazání:", err);
-    res.status(500).json({
-      success: false,
-      message: "Chyba při mazání modelu.",
-    });
+
+    return jsonResponse(
+      {
+        success: false,
+        message: "Chyba při mazání modelu.",
+      },
+      500,
+    );
   }
-});
+}
 
-// DEBUG ENDPOINT
+async function handleDebugChunk(modelName, chunkIndex) {
+  return jsonResponse(
+    {
+      success: false,
+      message: "Debug chunk endpoint je vypnutý, protože pipeline nyní používá overview stages a detail tiles.",
+      model: modelName,
+      chunkIndex,
+    },
+    410,
+  );
+}
 
-app.get("/debug-chunk/:modelName/:chunkIndex", async (req, res) => {
-  const { modelName, chunkIndex } = req.params;
-  const modelDir = path.join(CHUNKS_DIR, modelName.replace(".glb", ""));
-  const chunkPath = path.join(modelDir, `chunk_${chunkIndex}.bin`);
-  const gzipPath = chunkPath + ".gz";
+async function handleRequest(request) {
+  const url = new URL(request.url);
+  const pathname = url.pathname;
+  const segments = pathname.split("/").filter(Boolean);
+  const method = request.method.toUpperCase();
 
+  if (method === "POST" && pathname === "/upload-model") {
+    return handleUploadModel(request);
+  }
+
+  if (method === "GET" && pathname === "/models") {
+    return handleModelsList();
+  }
+
+  if (method === "GET" && pathname === "/upload-status") {
+    return handleUploadStatus();
+  }
+
+  if (method === "POST" && pathname === "/create-all-chunks") {
+    return handleCreateAllChunks();
+  }
+
+  if (
+    method === "GET" &&
+    segments[0] === "model-metadata" &&
+    segments.length === 2
+  ) {
+    return handleModelMetadata(decodeParam(segments[1]));
+  }
+
+  if (
+    method === "GET" &&
+    segments[0] === "stream-bootstrap" &&
+    segments.length === 2
+  ) {
+    return handleStreamBootstrap(decodeParam(segments[1]));
+  }
+
+  if (
+    method === "GET" &&
+    segments[0] === "stream-manifest" &&
+    segments.length === 2
+  ) {
+    return handleStreamManifest(decodeParam(segments[1]));
+  }
+
+  if (
+    method === "GET" &&
+    segments[0] === "download-chunk" &&
+    segments.length === 3
+  ) {
+    return handleDownloadChunk(
+      request,
+      decodeParam(segments[1]),
+      decodeParam(segments[2]),
+    );
+  }
+
+  if (
+    method === "GET" &&
+    segments[0] === "download-model" &&
+    segments.length === 2
+  ) {
+    return handleDownloadModel(request, decodeParam(segments[1]));
+  }
+
+  if (
+    method === "GET" &&
+    segments[0] === "model-info" &&
+    segments.length === 2
+  ) {
+    return handleModelInfo(decodeParam(segments[1]));
+  }
+
+  if (
+    method === "POST" &&
+    segments[0] === "create-chunks" &&
+    segments.length === 2
+  ) {
+    return handleCreateChunks(decodeParam(segments[1]));
+  }
+
+  if (method === "DELETE" && segments[0] === "model" && segments.length === 2) {
+    return handleDeleteModel(decodeParam(segments[1]));
+  }
+
+  if (
+    method === "GET" &&
+    segments[0] === "debug-chunk" &&
+    segments.length === 3
+  ) {
+    return handleDebugChunk(decodeParam(segments[1]), decodeParam(segments[2]));
+  }
+
+  if (method === "GET") {
+    return serveStatic(pathname);
+  }
+
+  return jsonResponse(
+    {
+      success: false,
+      message: "Endpoint nebyl nalezen.",
+    },
+    404,
+  );
+}
+
+function startServer(serverPort, options = {}) {
   try {
-    const originalData = await fsp.readFile(chunkPath);
-    const originalHash = crypto
-      .createHash("sha256")
-      .update(originalData)
-      .digest("hex");
-
-    let gzipData = null;
-    let decompressedHash = null;
-
-    try {
-      gzipData = await fsp.readFile(gzipPath);
-
-      // Dekomprimuj GZIP a spočítej hash
-      const decompressed = await gunzip(gzipData);
-      decompressedHash = crypto
-        .createHash("sha256")
-        .update(decompressed)
-        .digest("hex");
-    } catch {}
-
-    // Načti metadata
-    const metadataPath = path.join(METADATA_DIR, `${modelName}.json`);
-    let metadataHash = null;
-
-    try {
-      const metadataContent = await fsp.readFile(metadataPath, "utf8");
-      const metadata = JSON.parse(metadataContent);
-      metadataHash = metadata.chunkHashes[parseInt(chunkIndex)];
-    } catch {}
-
-    res.json({
-      chunkIndex: parseInt(chunkIndex),
-      originalSize: originalData.length,
-      originalHash,
-      gzipSize: gzipData?.length || null,
-      decompressedHash,
-      metadataHash,
-      hashesMatch: originalHash === metadataHash,
-      explanation: {
-        originalHash: "Hash z nekomprimovaného .bin souboru",
-        decompressedHash:
-          "Hash z dekomprimovaného .gz souboru (měl by se rovnat originalHash)",
-        metadataHash: "Hash uložený v metadata.json",
-        hashesMatch:
-          "Zda se originalHash shoduje s metadataHash (mělo by být true)",
+    Bun.serve({
+      port: serverPort,
+      hostname: "0.0.0.0",
+      maxRequestBodySize: MAX_UPLOAD_SIZE,
+      fetch: handleRequest,
+      ...options,
+      error(error) {
+        console.error("Chyba serveru:", error);
+        return jsonResponse(
+          {
+            success: false,
+            message: "Interní chyba serveru.",
+          },
+          500,
+        );
       },
     });
+
+    return true;
   } catch (err) {
-    if (err.code === "ENOENT") {
-      return res.status(404).json({ error: "Chunk not found" });
-    }
-    res.status(500).json({ error: err.message });
+    console.error(
+      options.tls
+        ? "HTTPS server se nepodařilo spustit:"
+        : "HTTP server se nepodařilo spustit:",
+      err.message,
+    );
+    return false;
   }
-});
+}
 
-// START SERVERU
+console.log("\n" + "=".repeat(60));
+const httpStarted = startServer(port);
+let tlsStarted = false;
 
-app.listen(port, "0.0.0.0", () => {
-  console.log("\n" + "=".repeat(60));
-  console.log(`HTTP/1.1 Server běží na http://0.0.0.0:${port}`);
+if (httpStarted) {
+  console.log(`HTTP Server běží na http://0.0.0.0:${port}`);
   console.log("=".repeat(60));
-});
+}
 
-const httpsPort = 3443;
 try {
-  const http2 = require("http2");
-
-  const sslOptions = {
-    key: fs.readFileSync(path.join(__dirname, "key.pem")),
-    cert: fs.readFileSync(path.join(__dirname, "cert.pem")),
-    allowHTTP1: true,
-  };
-
-  const http2Server = http2.createSecureServer(sslOptions, app);
-
-  http2Server.listen(httpsPort, "0.0.0.0", () => {
-    console.log(`HTTPS/HTTP2 Server běží na https://0.0.0.0:${httpsPort}`);
-    console.log("=".repeat(60));
+  tlsStarted = startServer(httpsPort, {
+    tls: {
+      key: fs.readFileSync(path.join(__dirname, "key.pem")),
+      cert: fs.readFileSync(path.join(__dirname, "cert.pem")),
+    },
   });
+
+  if (tlsStarted) {
+    console.log(`HTTPS Server běží na https://0.0.0.0:${httpsPort}`);
+    console.log("=".repeat(60));
+  }
 } catch (err) {
   console.error("HTTPS server se nepodařilo spustit:", err.message);
-  console.log("Server běží pouze na HTTP/1.1\n");
+}
+
+if (httpStarted && !tlsStarted) {
+  console.log("Server běží pouze na HTTP\n");
+} else if (!httpStarted && tlsStarted) {
+  console.log("Server běží pouze na HTTPS\n");
+} else if (!httpStarted && !tlsStarted) {
+  console.log("Server se nepodařilo spustit na HTTP ani HTTPS\n");
 }
